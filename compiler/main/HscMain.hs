@@ -307,6 +307,7 @@ hscParse' mod_summary
     dflags <- getDynFlags
     let src_filename  = ms_hspp_file mod_summary
         maybe_src_buf = ms_hspp_buf  mod_summary
+        refSrcFileCache = srcFileCache dflags
 
     --------------------------  Parser  ----------------
     -- sometimes we already have the buffer in memory, perhaps
@@ -316,7 +317,9 @@ hscParse' mod_summary
                Just b  -> return b
                Nothing -> liftIO $ hGetStringBuffer src_filename
 
-    let loc = mkRealSrcLoc (mkFastString src_filename) 1 1
+    let srcFilenameFS = mkFastString src_filename
+    _ <- liftIO (getOrCacheSrcFile refSrcFileCache srcFilenameFS (pure buf))
+    let loc = mkRealSrcLoc srcFilenameFS 1 1
     let parseMod | HsigFile == ms_hsc_src mod_summary
                  = parseSignature
                  | otherwise = parseModule

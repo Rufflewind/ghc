@@ -61,8 +61,7 @@ import Outputable
 import Panic
 import SrcLoc
 import DynFlags
-import FastString (unpackFS)
-import StringBuffer (hGetStringBuffer, len, lexemeToString)
+import FastString (FastString)
 
 import System.Directory
 import System.Exit      ( ExitCode(..), exitWith )
@@ -77,7 +76,6 @@ import Data.Time
 import Control.Monad
 import Control.Monad.IO.Class
 import System.IO
-import System.IO.Error  ( catchIOError )
 import GHC.Conc         ( getAllocationCounter )
 import System.CPUTime
 
@@ -217,36 +215,16 @@ getSeverityColour SevError   = colRedFg
 getSeverityColour SevFatal   = colRedFg
 getSeverityColour _          = mempty
 
-getCaretDiagnostic :: Severity -> SrcSpan -> IO MsgDoc
-getCaretDiagnostic _ (UnhelpfulSpan _) = pure empty
-getCaretDiagnostic severity (RealSrcSpan span) = do
+getCaretDiagnostic :: (FastString -> Int -> IO (Maybe String))
+                      -- ^ Function used to get a line of the source code
+                      -- (see, for example, 'getCachedSrcLineWithDynFlags')
+                   -> Severity
+                   -> SrcSpan
+                   -> IO MsgDoc
+getCaretDiagnostic _ _ (UnhelpfulSpan _) = pure empty
+getCaretDiagnostic getSrcLine severity (RealSrcSpan span) = do
   caretDiagnostic <$> getSrcLine (srcSpanFile span) (row - 1)
-
   where
-
-    getSrcLine fn i = do
-      (getLine i <$> readFile' (unpackFS fn))
-        `catchIOError` \ _ ->
-          pure Nothing
-
-    getLine i contents =
-      case drop i (lines contents) of
-        srcLine : _ -> Just srcLine
-        [] -> Nothing
-
-    readFile' fn = do
-      -- StringBuffer has advantages over readFile:
-      -- (a) no lazy IO, otherwise IO exceptions may occur in pure code
-      -- (b) always UTF-8, rather than some system-dependent encoding
-      --     (Haskell source code must be UTF-8 anyway)
-      buf <- hGetStringBuffer fn
-      pure (fix <$> lexemeToString buf (len buf))
-
-    -- allow user to visibly see that their code is incorrectly encoded
-    -- (StringBuffer.nextChar uses \0 to represent undecodable characters)
-    fix '\0' = '\xfffd'
-    fix c    = c
-
     sevColour = colBold `mappend` getSeverityColour severity
 
     marginColour = colBold `mappend` colBlueFg

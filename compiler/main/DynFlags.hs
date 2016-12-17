@@ -150,6 +150,8 @@ module DynFlags (
         -- * Linker/compiler information
         LinkerInfo(..),
         CompilerInfo(..),
+
+        CachedSrcFile, getOrCacheSrcFile, getOrLoadSrcFile, getCachedSrcLine
   ) where
 
 #include "HsVersions.h"
@@ -173,6 +175,8 @@ import qualified Pretty
 import SrcLoc
 import BasicTypes       ( IntWithInf, treatZeroAsInf )
 import FastString
+import StringBuffer     ( StringBuffer, atEnd, byteDiff, hGetStringBuffer
+                        , lexemeToString, nextChar, offsetBytes )
 import Outputable
 import Foreign.C        ( CInt(..) )
 import System.IO.Unsafe ( unsafeDupablePerformIO )
@@ -194,6 +198,8 @@ import Data.Ord
 import Data.Bits
 import Data.Char
 import Data.Int
+import Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
 import Data.List
 import Data.Map (Map)
 import qualified Data.Map as Map
@@ -917,7 +923,9 @@ data DynFlags = DynFlags {
 
   -- | Unique supply configuration for testing build determinism
   initialUnique         :: Int,
-  uniqueIncrement       :: Int
+  uniqueIncrement       :: Int,
+
+  srcFileCache          :: IORef (Map FastString CachedSrcFile)
 }
 
 class HasDynFlags m where
@@ -1264,6 +1272,76 @@ overrideWith b Auto   = b
 overrideWith _ Always = True
 overrideWith _ Never  = False
 
+data CachedSrcFile =
+  CachedSrcFile
+  { csfBuf         :: !StringBuffer
+  , csfLineOffsets :: IntMap Int
+  } deriving Show
+
+getOrCacheSrcFile :: IORef (Map FastString CachedSrcFile)
+                  -> FastString
+                  -> IO StringBuffer
+                  -> IO CachedSrcFile
+getOrCacheSrcFile refSrcFileCache filename getBuf = do
+  cache <- readIORef refSrcFileCache
+  case Map.lookup filename cache of
+    Just value -> pure value
+    Nothing    -> do
+      buf <- getBuf
+      let lineOffsets = getLineOffsets buf
+      let value =
+            CachedSrcFile
+            { csfBuf = buf
+            , csfLineOffsets = IntMap.fromAscList (zip [0 ..] lineOffsets)
+            }
+      writeIORef refSrcFileCache (Map.insert filename value cache)
+      pure value
+
+getOrLoadSrcFile :: IORef (Map FastString CachedSrcFile)
+                 -> FastString
+                 -> IO CachedSrcFile
+getOrLoadSrcFile refSrcFileCache filename = do
+  getOrCacheSrcFile refSrcFileCache filename
+    (hGetStringBuffer (unpackFS filename))
+
+-- | Get the @n@-th line of the given @filename@.  If it is not cached, it
+-- will be read from disk.  Returns 'Nothing' on failure for any reason.  (No
+-- 'IOError's will be thrown.)
+getCachedSrcLineWithDynFlags :: DynFlags   -- ^ to get the @srcFileCache@
+                             -> FastString -- ^ @filename@
+                             -> Int        -- ^ @n@, the line number
+                             -> IO (Maybe String)
+getCachedSrcLineWithDynFlags dflags filename i = do
+  (getCachedSrcLine i <$> getOrLoadSrcFile (srcFileCache dflags) filename)
+    `catchIOError` \ _ ->
+      pure Nothing
+
+getCachedSrcLine :: Int -> CachedSrcFile -> Maybe String
+getCachedSrcLine i cachedSrcFile = do
+  substr <$> IntMap.lookup i offsets <*> IntMap.lookup (i + 1) offsets
+  where
+    substr oi oj = fix <$> lexemeToString (offsetBytes oi buf) (oj - oi)
+    -- allow user to visibly see that their code is incorrectly encoded
+    -- (StringBuffer.nextChar uses \0 to represent undecodable characters)
+    fix '\0' = '\xfffd'
+    fix c    = c
+    buf = csfBuf cachedSrcFile
+    offsets = csfLineOffsets cachedSrcFile
+
+-- | Get a list of byte offsets for each line, plus one extra entry for the
+-- length of the entire string.
+getLineOffsets :: StringBuffer -> [Int]
+getLineOffsets buf0 = 0 : getOffsets buf0
+  where
+    getOffsets buf
+      | atEnd buf = [byteDiff buf0 buf]
+      | otherwise =
+          let (c, buf') = nextChar buf
+              offsets' = getOffsets buf'
+          in if c == '\n'
+             then (byteDiff buf0 buf') : offsets'
+             else offsets'
+
 -----------------------------------------------------------------------------
 -- Ways
 
@@ -1459,6 +1537,7 @@ initDynFlags dflags = do
  refGeneratedDumps <- newIORef Set.empty
  refRtldInfo <- newIORef Nothing
  refRtccInfo <- newIORef Nothing
+ refSrcFileCache <- newIORef Map.empty
  wrapperNum <- newIORef emptyModuleEnv
  canUseUnicode <- do let enc = localeEncoding
                          str = "‘’"
@@ -1478,7 +1557,8 @@ initDynFlags dflags = do
         useUnicode    = canUseUnicode,
         canUseColor   = canUseColor,
         rtldInfo      = refRtldInfo,
-        rtccInfo      = refRtccInfo
+        rtccInfo      = refRtccInfo,
+        srcFileCache  = refSrcFileCache
         }
 
 -- | The normal 'DynFlags'. Note that they are not suitable for use in this form
@@ -1655,7 +1735,8 @@ defaultDynFlags mySettings =
         initialUnique = 0,
         uniqueIncrement = 1,
 
-        reverseErrors = False
+        reverseErrors = False,
+        srcFileCache = panic "defaultDynFlags: No srcFileCache"
       }
 
 defaultWays :: Settings -> [Way]
@@ -1706,7 +1787,9 @@ defaultLogAction dflags reason severity srcSpan style msg
                            hPutChar stderr '\n'
                            caretDiagnostic <-
                                if gopt Opt_DiagnosticsShowCaret dflags
-                               then getCaretDiagnostic severity srcSpan
+                               then getCaretDiagnostic
+                                      (getCachedSrcLineWithDynFlags dflags)
+                                      severity srcSpan
                                else pure empty
                            printErrs (message $+$ caretDiagnostic)
                                (setStyleColoured True style)
