@@ -846,7 +846,7 @@ mkErrorReport :: ReportErrCtxt -> TcLclEnv -> Report -> TcM ErrMsg
 mkErrorReport ctxt tcl_env (Report important relevant_bindings)
   = do { context <- mkErrInfo (cec_tidy ctxt) (tcl_ctxt tcl_env)
        ; mkErrDocAt (RealSrcSpan (tcl_loc tcl_env))
-            (errDoc important [context] relevant_bindings)
+            (errDoc important [] relevant_bindings)
        }
 
 type UserGiven = Implication
